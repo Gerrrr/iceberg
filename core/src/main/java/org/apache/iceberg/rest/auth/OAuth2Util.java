@@ -34,6 +34,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
+import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -416,6 +417,8 @@ public class OAuth2Util {
     private static int tokenRefreshNumRetries = 5;
     private static final long MAX_REFRESH_WINDOW_MILLIS = 300_000; // 5 minutes
     private static final long MIN_REFRESH_WAIT_MILLIS = 10;
+    private static final long MIN_REFRESH_RETRY_WAIT_MILLIS = 1_000; // 1 second
+    private static final long MAX_REFRESH_RETRY_WAIT_MILLIS = 60_000; // 1 minute
     private volatile Map<String, String> headers;
     private volatile AuthConfig config;
 
@@ -498,8 +501,23 @@ public class OAuth2Util {
      * @return interval to wait before calling refresh again, or null if no refresh is needed
      */
     public Pair<Integer, TimeUnit> refresh(RESTClient client) {
+      try {
+        return refreshOrThrow(client);
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to refresh token", e);
+        return null;
+      }
+    }
+
+    /**
+     * Like {@link #refresh(RESTClient)}, but throws if every refresh attempt failed with an
+     * exception, so that callers can tell a transient failure apart from a session that has nothing
+     * to refresh.
+     */
+    private Pair<Integer, TimeUnit> refreshOrThrow(RESTClient client) {
       if (token() != null && config.keepRefreshed()) {
         AtomicReference<OAuthTokenResponse> ref = new AtomicReference<>(null);
+        AtomicReference<Exception> failure = new AtomicReference<>(null);
         boolean isSuccessful =
             Tasks.foreach(ref)
                 .suppressFailureWhenFinished()
@@ -507,9 +525,16 @@ public class OAuth2Util {
                 .onFailure(
                     (holder, err) -> {
                       // attempt to refresh using the client credential instead of the parent token
-                      holder.set(refreshExpiredToken(client));
+                      try {
+                        holder.set(refreshExpiredToken(client));
+                      } catch (RuntimeException e) {
+                        if (e != err) {
+                          err.addSuppressed(e);
+                        }
+                      }
+
                       if (holder.get() == null) {
-                        LOG.warn("Failed to refresh token", err);
+                        failure.set(err);
                       }
                     })
                 .exponentialBackoff(
@@ -518,6 +543,10 @@ public class OAuth2Util {
                     COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT,
                     2.0 /* exponential */)
                 .run(holder -> holder.set(refreshCurrentToken(client)));
+
+        if (ref.get() == null && failure.get() != null) {
+          throw new RESTException(failure.get(), "Failed to refresh token");
+        }
 
         if (!isSuccessful || ref.get() == null) {
           return null;
@@ -590,10 +619,35 @@ public class OAuth2Util {
       // how much time to actually wait
       long timeToWait = Math.max(waitIntervalMillis, MIN_REFRESH_WAIT_MILLIS);
 
+      scheduleRefreshAttempt(client, executor, session, timeToWait, 0);
+    }
+
+    /**
+     * Schedule a refresh attempt. If the attempt fails, another attempt is scheduled with
+     * exponential backoff, so that a transient outage of the token endpoint does not leave the
+     * session with a token that is never refreshed again.
+     */
+    @SuppressWarnings("FutureReturnValueIgnored")
+    private static void scheduleRefreshAttempt(
+        RESTClient client,
+        ScheduledExecutorService executor,
+        AuthSession session,
+        long delayMillis,
+        int failedAttempts) {
       executor.schedule(
           () -> {
             long refreshStartTime = System.currentTimeMillis();
-            Pair<Integer, TimeUnit> expiration = session.refresh(client);
+            Pair<Integer, TimeUnit> expiration;
+            try {
+              expiration = session.refreshOrThrow(client);
+            } catch (RuntimeException e) {
+              long retryDelayMillis = refreshRetryDelayMillis(failedAttempts + 1);
+              LOG.warn("Failed to refresh token, retrying in {} ms", retryDelayMillis, e);
+              scheduleRefreshAttempt(
+                  client, executor, session, retryDelayMillis, failedAttempts + 1);
+              return;
+            }
+
             if (expiration != null) {
               scheduleTokenRefresh(
                   client,
@@ -602,8 +656,13 @@ public class OAuth2Util {
                   refreshStartTime + expiration.second().toMillis(expiration.first()));
             }
           },
-          timeToWait,
+          delayMillis,
           TimeUnit.MILLISECONDS);
+    }
+
+    private static long refreshRetryDelayMillis(int failedAttempts) {
+      long delay = MIN_REFRESH_RETRY_WAIT_MILLIS << Math.min(failedAttempts - 1, 16);
+      return Math.min(delay, MAX_REFRESH_RETRY_WAIT_MILLIS);
     }
 
     public static AuthSession fromAccessToken(

@@ -29,12 +29,17 @@ import static org.mockito.ArgumentMatchers.argThat;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.PlainJWT;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.rest.RESTClient;
 import org.apache.iceberg.rest.auth.OAuth2Util.AuthSession;
 import org.apache.iceberg.rest.responses.OAuthTokenResponse;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
@@ -250,6 +255,47 @@ public class TestOAuth2Util {
               Mockito.eq(OAuthTokenResponse.class),
               anyMap(),
               any());
+    }
+  }
+
+  @Test
+  void scheduledRefreshIsRetriedAfterTransientFailure() {
+    AuthSession parent =
+        new AuthSession(
+            Map.of(),
+            AuthConfig.builder()
+                .credential("testClientId:testClientSecret")
+                .oauth2ServerUri("/v1/token")
+                .build());
+
+    RESTException connectionRefused =
+        new RESTException("Error occurred while processing POST request");
+    OAuthTokenResponse refreshed = childTokenResponse("refreshed-token", 3600);
+
+    AuthSession.setTokenRefreshNumRetries(1);
+    ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+    try (RESTClient client = Mockito.mock(RESTClient.class)) {
+      Mockito.when(client.postForm(any(), anyMap(), any(), anyMap(), any()))
+          .thenThrow(connectionRefused, connectionRefused, connectionRefused)
+          .thenReturn(refreshed);
+
+      AuthSession session =
+          AuthSession.fromTokenResponse(
+              client,
+              executor,
+              childTokenResponse("initial-token", 1),
+              System.currentTimeMillis(),
+              parent);
+
+      Awaitility.await()
+          .atMost(10, TimeUnit.SECONDS)
+          .untilAsserted(() -> assertThat(session.token()).isEqualTo("refreshed-token"));
+      assertThat(session.headers()).containsEntry("Authorization", "Bearer refreshed-token");
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    } finally {
+      executor.shutdownNow();
+      AuthSession.setTokenRefreshNumRetries(5);
     }
   }
 
